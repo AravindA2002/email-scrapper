@@ -9,7 +9,7 @@ import time
 from typing import Set
 
 POLL_SECONDS = 5
-START_TS_MS = int(time.time() * 1000)   # Gmail internalDate is in milliseconds
+START_TS_MS = int(time.time() * 1000)   
 processed_ids: Set[str] = set()
 
 from docx import Document
@@ -19,7 +19,7 @@ from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 
-# -------------------- setup --------------------
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
 logger = logging.getLogger("email-poller")
 
@@ -30,15 +30,15 @@ OPENAI_MODEL   = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
 if not OPENAI_API_KEY or not OPENAI_API_KEY.startswith(("sk-", "sk-")):
     raise SystemExit("OPENAI_API_KEY missing or invalid. Put a server key in .env")
 
-# choose one place in your file
-MARK_AS_READ = True   # or False to disable
+
+MARK_AS_READ = True   
 
 SCOPES = ["https://www.googleapis.com/auth/gmail.modify"] if MARK_AS_READ \
          else ["https://www.googleapis.com/auth/gmail.readonly"]
 
-STATE_FILE = "state.json"   # stores last historyId or message ids processed
+STATE_FILE = "state.json" 
 
-# -------------------- Google Auth --------------------
+
 def get_gmail_service():
     creds = None
     if os.path.exists("token.json"):
@@ -54,7 +54,7 @@ def get_gmail_service():
             f.write(creds.to_json())
     return build("gmail", "v1", credentials=creds, cache_discovery=False)
 
-# -------------------- Attachment extraction --------------------
+
 def _b64(data: str) -> bytes:
     return base64.urlsafe_b64decode(data.encode("utf-8"))
 
@@ -98,16 +98,16 @@ def extract_attachment_text(filename: str, data: bytes) -> str:
     if name.endswith((".txt", ".md", ".html")):
         try: return data.decode("utf-8", errors="ignore")
         except: return ""
-    # images/others: skip text extraction but note filename
+   
     return ""
 
-# -------------------- OpenAI (Responses API) --------------------
+
 def openai_map_reduce(plain_text: str, attachments: List[Tuple[str,str]]) -> Dict:
     headers = {
         "Authorization": f"Bearer {OPENAI_API_KEY}",
         "Content-Type": "application/json",
     }
-    # Map: split to chunks to keep prompts small
+   
     chunks, size, step = [], len(plain_text), 4000
     for i in range(0, size, step):
         chunks.append(plain_text[i:i+step])
@@ -141,7 +141,7 @@ def openai_map_reduce(plain_text: str, attachments: List[Tuple[str,str]]) -> Dic
         # Fallback: wrap as JSON
         return {"subject": None, "key_points": [], "plain_text": reduce_input[:2000], "tl_dr": result_text[:500]}
 
-# -------------------- Gmail helpers --------------------
+
 def get_message_full(gmail, msg_id: str) -> Dict:
     return gmail.users().messages().get(userId="me", id=msg_id, format="full").execute()
 
@@ -150,13 +150,10 @@ def list_new_message_ids(gmail, since_ts: int) -> List[str]:
     Returns unread messages from Primary Inbox only.
     Filters to 'newer_than' to keep the list small on first run.
     """
-    # You can tighten/loosen this window; 14d is a safe default
+   
     q = "in:inbox category:primary label:unread newer_than:14d"
 
-    # If you keep your own timestamp, you can add it too (optional)
-    # if since_ts:
-    #     # Gmail doesn't support absolute epoch in queries; we rely on newer_than
-    #     pass
+   
 
     ids = []
     page_token = None
@@ -218,7 +215,7 @@ def plain_text_from_msg(msg: Dict) -> str:
             stack.append(c)
     return "\n\n".join(texts)
 
-# -------------------- Poll loop --------------------
+
 def load_state():
     if os.path.exists(STATE_FILE):
         return json.load(open(STATE_FILE))
@@ -233,7 +230,7 @@ def poll_forever():
 
     while True:
         try:
-            # Query: Primary Inbox; you can add label:unread if you still want unread-only
+        
             q = "in:inbox category:primary newer_than:14d"
             res = gmail.users().messages().list(userId="me", q=q, maxResults=50).execute()
             ids = [m["id"] for m in res.get("messages", [])]
@@ -242,22 +239,17 @@ def poll_forever():
                 if mid in processed_ids:
                     continue
 
-                # Fetch minimal metadata to check arrival time (internalDate is ms)
+            
                 meta = gmail.users().messages().get(
                     userId="me", id=mid, format="metadata"
                 ).execute()
 
                 internal_ms = int(meta.get("internalDate", "0"))
                 if internal_ms <= START_TS_MS:
-                    # arrived before the script started; skip
+                   
                     continue
 
-                # If you also want unread-only at runtime, uncomment this:
-                # labels = set(meta.get("labelIds", []))
-                # if "UNREAD" not in labels:
-                #     continue
-
-                # --- Process the message (your existing flow) ---
+              
                 msg = get_message_full(gmail, mid)
                 headers = msg.get("payload", {}).get("headers", [])
                 subject = next((h["value"] for h in headers if h["name"].lower()=="subject"), "(no subject)")
@@ -269,10 +261,10 @@ def poll_forever():
                     parsed = openai_map_reduce(body_text, atts)
                 except Exception as e:
                     logger.error("OpenAI parse failed: %s", e)
-                    # don't mark as processed so we can retry next loop
+                  
                     continue
 
-                # Save output
+               
                 ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
                 out = {"id": mid, "subject": subject, "received_ms": internal_ms, "parsed": parsed}
                 os.makedirs("out", exist_ok=True)
@@ -281,14 +273,14 @@ def poll_forever():
 
                 out_path = f"out/{ts}_{mid}.json"
                 size = os.path.getsize(out_path)
-                # optional mark-as-read
+               
                 mark_as_read(gmail, mid)
 
 
                 processed_ids.add(mid)
 
            
-                logger.info("✅ Saved %s (%d bytes) and finished message %s",out_path, size, mid)
+                logger.info("Saved %s (%d bytes) and finished message %s",out_path, size, mid)
                 logger.info("Polling for next email...")
 
 
