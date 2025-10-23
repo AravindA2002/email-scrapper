@@ -279,10 +279,20 @@ def poll_forever():
                 with open(f"out/{ts}_{mid}.json","w",encoding="utf-8") as f:
                     json.dump(out, f, ensure_ascii=False, indent=2)
 
-                # Optional: mark as read (requires gmail.modify scope)
-                # mark_as_read(gmail, mid)
+                out_path = f"out/{ts}_{mid}.json"
+                size = os.path.getsize(out_path)
+                # optional mark-as-read
+                mark_as_read(gmail, mid)
+
 
                 processed_ids.add(mid)
+
+           
+                logger.info("✅ Saved %s (%d bytes) and finished message %s",out_path, size, mid)
+                logger.info("Polling for next email...")
+
+
+                
 
         except Exception as e:
             logger.warning("Poll iteration error: %s", e)
