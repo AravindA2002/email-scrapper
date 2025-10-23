@@ -5,6 +5,13 @@ from typing import List, Dict, Tuple
 import requests
 import pdfplumber
 import pandas as pd
+import time
+from typing import Set
+
+POLL_SECONDS = 5
+START_TS_MS = int(time.time() * 1000)   # Gmail internalDate is in milliseconds
+processed_ids: Set[str] = set()
+
 from docx import Document
 from dotenv import load_dotenv
 
@@ -219,48 +226,69 @@ def load_state():
 
 def save_state(s): json.dump(s, open(STATE_FILE,"w"))
 
-def process_once():
+def poll_forever():
     gmail = get_gmail_service()
-    state = load_state()
-    ids = list_new_message_ids(gmail, state.get("last_run", 0))
-    new_ids = [i for i in ids if i not in set(state.get("seen", []))]
-    if not new_ids:
-        logger.info("No new messages.")
-        return
+    logger.info("Polling every %s seconds. Only emails AFTER %s will be processed.",
+                POLL_SECONDS, START_TS_MS)
 
-    for mid in new_ids:
-        msg = get_message_full(gmail, mid)
-        headers = msg.get("payload", {}).get("headers", [])
-        subject = next((h["value"] for h in headers if h["name"].lower()=="subject"), "(no subject)")
-        body_text = plain_text_from_msg(msg)
-        atts = get_attachments(gmail, msg)
-
-        logger.info("Parsing message %s: %s (attachments: %d)", mid, subject, len(atts))
+    while True:
         try:
-            parsed = openai_map_reduce(body_text, atts)
+            # Query: Primary Inbox; you can add label:unread if you still want unread-only
+            q = "in:inbox category:primary newer_than:14d"
+            res = gmail.users().messages().list(userId="me", q=q, maxResults=50).execute()
+            ids = [m["id"] for m in res.get("messages", [])]
+
+            for mid in ids:
+                if mid in processed_ids:
+                    continue
+
+                # Fetch minimal metadata to check arrival time (internalDate is ms)
+                meta = gmail.users().messages().get(
+                    userId="me", id=mid, format="metadata"
+                ).execute()
+
+                internal_ms = int(meta.get("internalDate", "0"))
+                if internal_ms <= START_TS_MS:
+                    # arrived before the script started; skip
+                    continue
+
+                # If you also want unread-only at runtime, uncomment this:
+                # labels = set(meta.get("labelIds", []))
+                # if "UNREAD" not in labels:
+                #     continue
+
+                # --- Process the message (your existing flow) ---
+                msg = get_message_full(gmail, mid)
+                headers = msg.get("payload", {}).get("headers", [])
+                subject = next((h["value"] for h in headers if h["name"].lower()=="subject"), "(no subject)")
+                body_text = plain_text_from_msg(msg)
+                atts = get_attachments(gmail, msg)
+
+                logger.info("Parsing NEW message %s (received now): %s (attachments: %d)", mid, subject, len(atts))
+                try:
+                    parsed = openai_map_reduce(body_text, atts)
+                except Exception as e:
+                    logger.error("OpenAI parse failed: %s", e)
+                    # don't mark as processed so we can retry next loop
+                    continue
+
+                # Save output
+                ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+                out = {"id": mid, "subject": subject, "received_ms": internal_ms, "parsed": parsed}
+                os.makedirs("out", exist_ok=True)
+                with open(f"out/{ts}_{mid}.json","w",encoding="utf-8") as f:
+                    json.dump(out, f, ensure_ascii=False, indent=2)
+
+                # Optional: mark as read (requires gmail.modify scope)
+                # mark_as_read(gmail, mid)
+
+                processed_ids.add(mid)
+
         except Exception as e:
-            logger.error("OpenAI parse failed: %s", e)
-            continue
+            logger.warning("Poll iteration error: %s", e)
 
-        # Output: write a JSON per email
-        ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-        out = {"id": mid, "subject": subject, "parsed": parsed}
-        os.makedirs("out", exist_ok=True)
-        with open(f"out/{ts}_{mid}.json","w",encoding="utf-8") as f:
-            json.dump(out, f, ensure_ascii=False, indent=2)
-        logger.info("Saved out/%s_%s.json", ts, mid)
-
-                # after saving output without errors
-        try:
-            mark_as_read(gmail, mid)   # comment this out if you prefer not to auto-mark read
-        except Exception as e:
-            logger.warning("Could not mark %s as read: %s", mid, e)
-
-
-        state.setdefault("seen", []).append(mid)
-        state["last_run"] = int(time.time())
-        save_state(state)
+        time.sleep(POLL_SECONDS)
 
 if __name__ == "__main__":
-    # run once; to daemonize, wrap in while True + sleep
-    process_once()
+    poll_forever()
+
