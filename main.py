@@ -118,7 +118,8 @@ def send_acknowledgement(gmail, *, original_msg, to_addr: str) -> None:
     if refs:
         em["References"] = refs
 
-    em.set_content(ACK_BODY)
+    em.set_content(ACK_BODY, subtype="plain", cte="7bit")
+
 
     
     raw = base64.urlsafe_b64encode(em.as_bytes()).decode("utf-8")
