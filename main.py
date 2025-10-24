@@ -174,6 +174,7 @@ def extract_attachment_text(filename: str, data: bytes) -> str:
     return ""
 
 
+'''
 def openai_map_reduce(plain_text: str, attachments: List[Tuple[str,str]]) -> Dict:
     headers = {
         "Authorization": f"Bearer {OPENAI_API_KEY}",
@@ -212,6 +213,8 @@ def openai_map_reduce(plain_text: str, attachments: List[Tuple[str,str]]) -> Dic
     except Exception:
        
         return {"subject": None, "key_points": [], "plain_text": reduce_input[:2000], "tl_dr": result_text[:500]}
+    
+'''
 
 
 def get_message_full(gmail, msg_id: str) -> Dict:
