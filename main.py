@@ -64,7 +64,7 @@ def get_gmail_service():
     return build("gmail", "v1", credentials=creds, cache_discovery=False)
 
 def _openai(payload: dict):
-    """Direct call to OpenAI API /v1/responses endpoint."""
+    
     headers = {
         "Authorization": f"Bearer {OPENAI_API_KEY}",
         "Content-Type": "application/json",
