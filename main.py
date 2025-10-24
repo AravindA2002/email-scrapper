@@ -6,6 +6,11 @@ import requests
 import pdfplumber
 import pandas as pd
 import time
+import base64
+import re
+from bs4 import BeautifulSoup
+from email.message import EmailMessage
+from email.utils import parseaddr
 from typing import Set
 
 POLL_SECONDS = 5
@@ -26,6 +31,8 @@ logger = logging.getLogger("email-poller")
 load_dotenv()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 OPENAI_MODEL   = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
+USE_OPENAI_CLEAN = os.environ.get("USE_OPENAI_CLEAN", "false").lower() in ("1","true","yes")
+
 
 if not OPENAI_API_KEY or not OPENAI_API_KEY.startswith(("sk-", "sk-")):
     raise SystemExit("OPENAI_API_KEY missing or invalid. Put a server key in .env")
@@ -33,10 +40,12 @@ if not OPENAI_API_KEY or not OPENAI_API_KEY.startswith(("sk-", "sk-")):
 
 MARK_AS_READ = True   
 
-SCOPES = ["https://www.googleapis.com/auth/gmail.modify"] if MARK_AS_READ \
-         else ["https://www.googleapis.com/auth/gmail.readonly"]
-
+SCOPES = [
+    "https://www.googleapis.com/auth/gmail.modify",  
+    "https://www.googleapis.com/auth/gmail.send",    
+]
 STATE_FILE = "state.json" 
+
 
 
 def get_gmail_service():
@@ -54,9 +63,71 @@ def get_gmail_service():
             f.write(creds.to_json())
     return build("gmail", "v1", credentials=creds, cache_discovery=False)
 
+def _openai(payload: dict):
+    """Direct call to OpenAI API /v1/responses endpoint."""
+    headers = {
+        "Authorization": f"Bearer {OPENAI_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    r = requests.post("https://api.openai.com/v1/responses", headers=headers, json=payload, timeout=60)
+    r.raise_for_status()
+    return r.json()
+
+def clean_text_with_openai(text: str) -> str:
+    if not text or not USE_OPENAI_CLEAN:
+        return text or ""
+    try:
+        payload = {
+            "model": os.getenv("OPENAI_MODEL", "gpt-4.1-mini"),
+            "input": f"Clean and normalize this text for downstream parsing. Output plain text only:\n\n{text[:120000]}",
+        }
+        data = _openai(payload)  
+       
+        return data.get("output_text", text)  
+    except Exception as e:
+        logger.warning("OpenAI clean failed, returning raw text: %s", e)
+        return text or ""
 
 def _b64(data: str) -> bytes:
     return base64.urlsafe_b64decode(data.encode("utf-8"))
+
+ACK_SUBJECT_PREFIX = "Re: "
+ACK_BODY = (
+    "Hi,\n\n"
+    "Your invoice email has been received. Please allow us some time to process the invoice.\n\n"
+    "Thanks"
+)
+
+def get_header(msg, name, default=""):
+    headers = msg.get("payload", {}).get("headers", [])
+    return next((h["value"] for h in headers if h["name"].lower() == name.lower()), default)
+
+def send_acknowledgement(gmail, *, original_msg, to_addr: str) -> None:
+   
+    subject = get_header(original_msg, "Subject", "(no subject)")
+    thread_id = original_msg.get("threadId")
+
+    em = EmailMessage()
+    em["To"] = to_addr
+    em["Subject"] = f"{ACK_SUBJECT_PREFIX}{subject}"
+    em["In-Reply-To"] = get_header(original_msg, "Message-ID", "")
+    refs = " ".join(filter(None, [
+        get_header(original_msg, "References", ""),
+        get_header(original_msg, "Message-ID", "")
+    ])).strip()
+    if refs:
+        em["References"] = refs
+
+    em.set_content(ACK_BODY)
+
+    
+    raw = base64.urlsafe_b64encode(em.as_bytes()).decode("utf-8")
+
+    body = {"raw": raw}
+    if thread_id:
+        body["threadId"] = thread_id  
+
+    gmail.users().messages().send(userId="me", body=body).execute()
 
 def extract_text_from_pdf(b: bytes) -> str:
     try:
@@ -138,7 +209,7 @@ def openai_map_reduce(plain_text: str, attachments: List[Tuple[str,str]]) -> Dic
     try:
         return json.loads(result_text)
     except Exception:
-        # Fallback: wrap as JSON
+       
         return {"subject": None, "key_points": [], "plain_text": reduce_input[:2000], "tl_dr": result_text[:500]}
 
 
@@ -146,10 +217,7 @@ def get_message_full(gmail, msg_id: str) -> Dict:
     return gmail.users().messages().get(userId="me", id=msg_id, format="full").execute()
 
 def list_new_message_ids(gmail, since_ts: int) -> List[str]:
-    """
-    Returns unread messages from Primary Inbox only.
-    Filters to 'newer_than' to keep the list small on first run.
-    """
+    
    
     q = "in:inbox category:primary label:unread newer_than:14d"
 
@@ -202,18 +270,53 @@ def get_attachments(gmail, msg: Dict) -> List[Tuple[str,str]]:
     walk(payload)
     return out
 
+  
+
+def _normalize_text(s: str) -> str:
+    if not s:
+        return ""
+  
+    s = s.replace("\r\n", "\n").replace("\r", "\n")
+    s = re.sub(r"\n{3,}", "\n\n", s)
+    return s.strip()
+
+def _html_to_text(html: str) -> str:
+    if not html:
+        return ""
+    soup = BeautifulSoup(html, "html.parser")
+   
+    text = soup.get_text(separator="\n")
+    return _normalize_text(text)
+
 def plain_text_from_msg(msg: Dict) -> str:
+    
     payload = msg.get("payload", {})
     stack = [payload]
-    texts = []
+    plains = []
+    htmls = []
+
     while stack:
         p = stack.pop()
-        mime = p.get("mimeType","")
-        if mime in ("text/plain", "text/html"):
-            texts.append(decode_payload(p))
+        mime = p.get("mimeType", "") or ""
+        if mime == "text/plain":
+            plains.append(decode_payload(p))
+        elif mime == "text/html":
+            htmls.append(decode_payload(p))
         for c in p.get("parts", []) or []:
             stack.append(c)
-    return "\n\n".join(texts)
+
+    if plains:
+      
+        text = "\n\n".join(t for t in ( _normalize_text(x) for x in plains ) if t)
+        return text
+
+ 
+    if htmls:
+        text = "\n\n".join(t for t in (_html_to_text(h) for h in htmls) if t)
+        return text
+
+    return ""
+
 
 
 def load_state():
@@ -251,34 +354,52 @@ def poll_forever():
 
               
                 msg = get_message_full(gmail, mid)
-                headers = msg.get("payload", {}).get("headers", [])
-                subject = next((h["value"] for h in headers if h["name"].lower()=="subject"), "(no subject)")
+                
                 body_text = plain_text_from_msg(msg)
                 atts = get_attachments(gmail, msg)
 
-                logger.info("Parsing NEW message %s (received now): %s (attachments: %d)", mid, subject, len(atts))
-                try:
-                    parsed = openai_map_reduce(body_text, atts)
-                except Exception as e:
-                    logger.error("OpenAI parse failed: %s", e)
-                  
-                    continue
+             
+                email_text = clean_text_with_openai(body_text)
+                attachments_json = [
+                    {"filename": fn, "text": clean_text_with_openai(txt)}
+                    for (fn, txt) in atts
+                    ]
+                
+                out_doc = {"email_text": email_text, "attachments": attachments_json}
 
-               
-                ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-                out = {"id": mid, "subject": subject, "received_ms": internal_ms, "parsed": parsed}
                 os.makedirs("out", exist_ok=True)
-                with open(f"out/{ts}_{mid}.json","w",encoding="utf-8") as f:
-                    json.dump(out, f, ensure_ascii=False, indent=2)
-
+                ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
                 out_path = f"out/{ts}_{mid}.json"
+                with open(out_path, "w", encoding="utf-8") as f:
+                    json.dump(out_doc, f, ensure_ascii=False, indent=2)
+
                 size = os.path.getsize(out_path)
-               
-                mark_as_read(gmail, mid)
+                logger.info(f"Saved {out_path} ({size} bytes); ready for downstream invoice parsing.")
+
+           
+                from_header = get_header(msg, "From", "")
+                _, sender_email = parseaddr(from_header)
+
+                try:
+                    if sender_email:
+                        send_acknowledgement(gmail, original_msg=msg, to_addr=sender_email)
+                        logger.info("Sent acknowledgement to %s", sender_email)
+
+                    else:
+                        logger.warning("Could not parse sender address from From: %r", from_header)
+
+                except Exception as e:
+                    logger.error("Failed to send acknowledgement: %s", e)
 
 
                 processed_ids.add(mid)
 
+
+               
+                mark_as_read(gmail, mid)
+
+
+               
            
                 logger.info("Saved %s (%d bytes) and finished message %s",out_path, size, mid)
                 logger.info("Polling for next email...")
